@@ -52,6 +52,7 @@ dev = [
     "build>=0.10.0",
     # Development
     "ipykernel>=7.1.0",
+    "Pillow>=9.0.0",
     # Agent-level testing
     "strands-agents-tools",
 ]

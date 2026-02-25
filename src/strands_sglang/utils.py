@@ -83,3 +83,30 @@ def get_tokenizer(tokenizer_path: str) -> PreTrainedTokenizer:
     from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(tokenizer_path, trust_remote_code=True)
+
+
+@lru_cache(maxsize=None)
+def get_processor(processor_path: str) -> Any:
+    """Get a shared (cached) processor for VLM models.
+
+    Returns the HuggingFace processor if the model has one (e.g., Qwen3-VL),
+    or ``None`` for text-only models.
+
+    Args:
+        processor_path: Path or HuggingFace model ID for the processor.
+
+    Returns:
+        Cached processor instance, or None if the model is text-only.
+    """
+    from transformers import AutoProcessor, PreTrainedTokenizerBase, ProcessorMixin
+
+    try:
+        proc = AutoProcessor.from_pretrained(processor_path, trust_remote_code=True)
+    except (OSError, ValueError):
+        return None
+
+    # If HF returned a tokenizer instead of a processor, it's a text-only model
+    if isinstance(proc, PreTrainedTokenizerBase) or not isinstance(proc, ProcessorMixin):
+        return None
+
+    return proc
