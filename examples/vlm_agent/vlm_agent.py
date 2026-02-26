@@ -1,30 +1,21 @@
 #!/usr/bin/env python3
 
-from __future__ import annotations
-
-import argparse
 import asyncio
-import base64
-import logging
+import json
 import os
+
 from pathlib import Path
+import base64
 
 from strands import Agent, tool
 from transformers import AutoProcessor, AutoTokenizer
 
-from strands_sglang import SGLangClient, SGLangModel, ToolLimiter
+from strands_sglang import SGLangModel, ToolLimiter
+from strands_sglang.client import SGLangClient
 from strands_sglang.tool_parsers import HermesToolParser
 
-logging.basicConfig(level=logging.INFO, format="%(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger(__name__)
 
 IMAGE_DIR = Path(__file__).parent / "images"
-
-SYSTEM_PROMPT = """"""
-
-# ---------------------------------------------------------------------------
-# Tool: read_image
-# ---------------------------------------------------------------------------
 
 @tool
 def read_image(file_path: str) -> dict:
@@ -59,42 +50,46 @@ def read_image(file_path: str) -> dict:
         ],
     }
 
+async def main():
+    # -------------------------------------------------------------------------
+    # 1. Setup
+    # -------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-
-
-async def run_agent(base_url: str, model_path: str) -> None:
-    """Run the VLM agent and inspect TITO state."""
-    # --- Setup ---
-    client = SGLangClient(base_url=base_url)
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
+    # Create SGLangModel with token-level trajectory tracking support
+    client = SGLangClient(base_url=os.environ.get("SGLANG_BASE_URL", "http://localhost:30000"))
+    model_info = await client.get_model_info()
+    tokenizer = AutoTokenizer.from_pretrained(model_info["model_path"])
+    processor = AutoProcessor.from_pretrained(model_info["model_path"])
 
     model = SGLangModel(
         client=client,
         tokenizer=tokenizer,
         processor=processor,
         tool_parser=HermesToolParser(),
-        sampling_params={"max_new_tokens": 1024, "temperature": 0.7},
+        sampling_params={"max_new_tokens": 8192},
     )
 
-    tool_limiter = ToolLimiter(max_tool_iters=5)
+    # -------------------------------------------------------------------------
+    # 2. VLM Agent Example
+    # -------------------------------------------------------------------------
+
+    print("\n" + "=" * 60)
+    print("VLM Agent Example")
+    print("=" * 60)
+
+    # Reset for new episode
+    model.reset()
+
+    # Create agent with read_image tool
     agent = Agent(
         model=model,
         tools=[read_image],
-        hooks=[tool_limiter],
-        system_prompt=SYSTEM_PROMPT,
+        hooks=[ToolLimiter(max_tool_iters=5)],
+        system_prompt="",
+        callback_handler=None,  # Disable print callback for cleaner output
     )
 
     # --- Build prompt with inline image ---
-    # a.jpg is provided directly in the user message (image in initial prompt).
-    # b.png must be loaded via the read_image tool (image from tool result).
-    #
-    # Strands Agent accepts list[ContentBlock] as prompt, where ContentBlock
-    # is a TypedDict with optional keys: text, image, toolResult, etc.
-    # Images are plain base64 data URL strings.
     image_a_bytes = (IMAGE_DIR / "a.jpg").read_bytes()
     image_a_data_url = f"data:image/jpeg;base64,{base64.b64encode(image_a_bytes).decode()}"
     prompt = [
@@ -108,69 +103,83 @@ async def run_agent(base_url: str, model_path: str) -> None:
         },
     ]
 
-    try:
-        result = await agent.invoke_async(prompt)
-        logger.info("Agent completed successfully")
-    except Exception as e:
-        logger.warning(f"Agent stopped: {type(e).__name__}: {e}")
+    # Invoke agent
+    await agent.invoke_async(prompt)
 
-    # --- Inspect TITO state ---
-    tm = model.token_manager
-    print("\n" + "=" * 60)
-    print("TITO Token Manager State")
-    print("=" * 60)
-    print(f"  Total tokens:    {len(tm)}")
-    print(f"  Segments:        {len(tm.segments)}")
-    if not tm.segments:
-        print("  (no segments — agent may have failed before generation)")
-        model.reset()
-        agent.cleanup()
-        await client.close()
-        return
 
-    for i, (is_output, length) in enumerate(tm.segment_info):
-        label = "RESPONSE" if is_output else "PROMPT"
-        print(f"    [{i}] {label:8s}  {length:5d} tokens")
+    def truncate_base64(obj):
+        """Truncate base64 data URLs for readable output."""
+        if isinstance(obj, dict):
+            return {k: truncate_base64(v) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [truncate_base64(v) for v in obj]
+        if isinstance(obj, str) and obj.startswith("data:image/") and ";base64," in obj:
+            prefix = obj[: obj.index(";base64,") + len(";base64,")]
+            return prefix + obj[len(prefix) : len(prefix) + 20] + "..."
+        return obj
 
-    prompt_len = len(tm.segments[0])
-    print(f"\n  Initial prompt:  {prompt_len} tokens")
-    print(f"  Rollout tokens:  {len(tm) - prompt_len}")
-    print(f"  Output tokens:   {sum(1 for t in tm.tokens if t.loss_mask)}")
+    print(f"\n[Output Trajectory]: {json.dumps(truncate_base64(agent.messages), indent=2)}")
 
-    print(f"\n  Loss mask:       {tm.loss_mask[:10]}... (first 10)")
-    has_logprobs = any(lp is not None for lp in tm.logprobs)
-    print(f"  Has logprobs:    {has_logprobs}")
+    # -------------------------------------------------------------------------
+    # 3. Access TITO Data
+    # -------------------------------------------------------------------------
 
-    # --- Inspect VLM state ---
-    print("\n" + "=" * 60)
+    print("\n" + "-" * 40)
+    print("TITO Data (for RL training)")
+    print("-" * 40)
+
+    # Token trajectory
+    token_ids = model.token_manager.token_ids
+    print(f"Total tokens: {len(token_ids)}")
+
+    # Output mask (True = model output, for loss computation)
+    output_mask = model.token_manager.loss_mask
+    n_output = sum(output_mask)
+    n_prompt = len(output_mask) - n_output
+    print(f"Prompt tokens: {n_prompt} (loss_mask=False)")
+    print(f"Response tokens: {n_output} (loss_mask=True)")
+
+    # Log probabilities
+    logprobs = model.token_manager.logprobs
+    output_logprobs = [lp for lp, mask in zip(logprobs, output_mask) if mask and lp is not None]
+    if output_logprobs:
+        avg_logprob = sum(output_logprobs) / len(output_logprobs)
+        print(f"Average output logprob: {avg_logprob:.4f}")
+
+    # Segment info
+    segment_info = model.token_manager.segment_info
+    print(f"Segments: {len(segment_info)} (Note: Segment 0 includes the system prompt and the user input)")
+    for i, (is_output, length) in enumerate(segment_info):
+        seg_type = "Response" if is_output else "Prompt"
+        print(f"  Segment {i}: {seg_type} ({length} tokens)")
+
+    # -------------------------------------------------------------------------
+    # VLM State
+    # -------------------------------------------------------------------------
+
+    print("\n" + "-" * 40)
     print("VLM State")
-    print("=" * 60)
-    print(f"  Images accumulated:  {len(model.image_data)}")
+    print("-" * 40)
+    print(f"Images accumulated: {len(model.image_data)}")
     for i, img_url in enumerate(model.image_data):
-        print(f"    [{i}] {img_url[:50]}...")
+        print(f"  [{i}] {img_url[:50]}...")
 
     mm_inputs = model.multimodal_train_inputs
     if mm_inputs:
-        print(f"\n  Multimodal train inputs:")
+        print(f"Multimodal train inputs:")
         for key, val in mm_inputs.items():
             if hasattr(val, "shape"):
-                print(f"    {key}: shape={val.shape}, dtype={val.dtype}")
+                print(f"  {key}: shape={val.shape}, dtype={val.dtype}")
             else:
-                print(f"    {key}: {type(val).__name__}")
+                print(f"  {key}: {type(val).__name__}")
     else:
-        print("\n  Multimodal train inputs: None")
+        print("Multimodal train inputs: None")
 
-    print(f"\n  Tool iterations: {tool_limiter.tool_iter_count}")
-    print(f"  Tool calls:      {tool_limiter.tool_call_count}")
-
-    # --- Decode full context ---
-    # Decode the entire token sequence so we can see the full conversation
-    # including system prompt, user message, tool calls, tool results, and
-    # final response. Vision tokens decode as <|image_pad|> placeholders.
-    full_text = tokenizer.decode(tm.token_ids, skip_special_tokens=False)
-    print("\n" + "=" * 60)
+    # Decode full context (vision tokens show as <|image_pad|> placeholders)
+    full_text = tokenizer.decode(model.token_manager.token_ids, skip_special_tokens=False)
+    print("\n" + "-" * 40)
     print("Full Context (decoded token sequence)")
-    print("=" * 60)
+    print("-" * 40)
     print(full_text)
 
     # Cleanup
@@ -179,28 +188,5 @@ async def run_agent(base_url: str, model_path: str) -> None:
     await client.close()
 
 
-def main():
-    parser = argparse.ArgumentParser(description="VLM Agent with image-returning tools")
-    parser.add_argument(
-        "--base-url",
-        default=os.environ.get("SGLANG_BASE_URL", "http://localhost:30000"),
-        help="SGLang server URL (default: http://localhost:30000)",
-    )
-    parser.add_argument(
-        "--model-path",
-        default=os.environ.get("MODEL_PATH", "Qwen/Qwen3-VL-2B-Instruct"),
-        help="HuggingFace model path for tokenizer/processor (default: Qwen/Qwen3-VL-2B-Instruct)",
-    )
-    args = parser.parse_args()
-
-    # Ensure images exist
-    if not (IMAGE_DIR / "a.jpg").exists():
-        print("Sample images not found. Run download_images.py first:")
-        print("  python examples/vlm_agent/download_images.py")
-        return
-
-    asyncio.run(run_agent(args.base_url, args.model_path))
-
-
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())

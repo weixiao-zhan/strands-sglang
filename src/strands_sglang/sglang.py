@@ -316,7 +316,7 @@ class SGLangModel(Model):
 
         1. Direct: ``{"type": "image", "image": "data:image/png;base64,..."}`` — passed through.
         2. Inline: ``{"image": "data:image/png;base64,..."}`` — normalized to type/image block.
-        3. Tool results: ``{"toolResult": {"content": [{"image": "data:..."}]}}`` — extracted.
+        3. Tool results: ``{"toolResult": {"content": [{"image": "data:..."}]}}``.
         """
         result: list[dict[str, Any]] = []
         if system_prompt:
@@ -329,11 +329,43 @@ class SGLangModel(Model):
             if isinstance(content, str):
                 result.append({"role": role, "content": content})
             elif isinstance(content, list):
-                normalized = cls._normalize_vlm_content_blocks(content)
-                formatted_msg: dict[str, Any] = {"role": role}
-                has_media = any(isinstance(b, dict) and b.get("type") in ("image", "video") for b in normalized)
-                formatted_msg["content"] = normalized if has_media else cls._flatten_text(normalized)
-                result.append(formatted_msg)
+                # Separate tool result blocks from other content blocks.
+                # Tool results must be emitted as role="tool" messages for the chat
+                # template to produce <tool_response> markup.
+                tool_result_blocks = [b for b in content if isinstance(b, dict) and "toolResult" in b]
+                other_blocks = [b for b in content if not (isinstance(b, dict) and "toolResult" in b)]
+
+                # Emit non-tool-result content (if any) as normal message
+                if other_blocks:
+                    normalized = cls._normalize_vlm_content_blocks(other_blocks)
+                    if normalized:
+                        has_media = any(
+                            isinstance(b, dict) and b.get("type") in ("image", "video") for b in normalized
+                        )
+                        result.append({
+                            "role": role,
+                            "content": normalized if has_media else cls._flatten_text(normalized),
+                        })
+
+                # Emit each tool result as a separate role="tool" message
+                for block in tool_result_blocks:
+                    tool_result = block["toolResult"]
+                    tool_use_id = tool_result.get("toolUseId", "")
+                    tr_content = tool_result.get("content", [])
+                    normalized = cls._normalize_vlm_content_blocks(tr_content) if isinstance(tr_content, list) else []
+                    has_media = any(
+                        isinstance(b, dict) and b.get("type") in ("image", "video") for b in normalized
+                    )
+                    tool_msg: dict[str, Any] = {
+                        "role": "tool",
+                        "tool_call_id": tool_use_id,
+                        "content": normalized if has_media else cls._flatten_text(normalized),
+                    }
+                    result.append(tool_msg)
+
+                # If no blocks at all, emit empty message
+                if not tool_result_blocks and not other_blocks:
+                    result.append({"role": role, "content": ""})
             else:
                 result.append({"role": role, "content": str(content) if content else ""})
 

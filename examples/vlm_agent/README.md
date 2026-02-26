@@ -7,7 +7,7 @@ This example demonstrates two ways images enter the strands-sglang VLM pipeline:
 
 ## How It Works
 
-```p
+```
 User message: [a.jpg IMAGE] "This is a.jpg. Use read_image to load b.jpg. Describe both."
   |
   v  _process_vlm_prompt() — first turn
@@ -16,10 +16,10 @@ User message: [a.jpg IMAGE] "This is a.jpg. Use read_image to load b.jpg. Descri
   v
 Model generates: <tool_call>{"name": "read_image", "arguments": {"file_path": "b.jpg"}}</tool_call>
   |
-  v  Tool reads b.jpg from disk → returns {"image": {"format": "jpg", "source": {"bytes": ...}}}
+  v  Tool reads b.jpg from disk → returns {"image": "data:image/jpeg;base64,..."}
+  |  _format_vlm_messages emits tool result
   |
   v  _process_vlm_incremental() — second turn
-  |  _format_vlm_messages converts tool result bytes → PIL Image
   |  processor(text, images=[b_pil]) → input_ids with vision tokens for b.jpg
   |  image_data = [a_b64, b_b64]  (accumulated)
   v
@@ -52,4 +52,5 @@ python -m sglang.launch_server \
 
 # 4. Run the example
 python examples/vlm_agent/vlm_agent.py
+# Configure via env vars: SGLANG_BASE_URL, MODEL_PATH
 ```

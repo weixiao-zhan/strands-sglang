@@ -292,14 +292,14 @@ class SGLangClient:
         """Get model information from the SGLang server.
 
         Returns:
-            Dict containing model info from `/get_model_info` endpoint, or None on error.
+            Dict containing model info from ``/model_info`` endpoint, or None on error.
             Important fields include:
             - model_path: HuggingFace model ID or local path
             - tokenizer_path: Tokenizer path (may differ from model_path)
         """
         try:
             session = self._get_session()
-            async with session.get("/get_model_info") as resp:
+            async with session.get("/model_info") as resp:
                 if resp.status >= 400:
                     return None
                 return await resp.json(content_type=None)
